@@ -1,72 +1,147 @@
-import asyncio
-from fastapi import FastAPI, Request, Header, HTTPException
+from fastapi import FastAPI, Request, Header
+from fastapi.responses import StreamingResponse
 from flowise import Flowise, PredictionData
 import json
-from fastapi.responses import StreamingResponse
-from typing import AsyncGenerator
+import os
+from dotenv import load_dotenv
+import time
+import asyncio
+
+load_dotenv()
 
 app = FastAPI()
 
-# Definimos el BaseURL fijo dentro del código
-BASE_URL = "https://flowise-liy3.onrender.com"
-
-async def stream_response(client, question: str, session_id: str, ChatflowId: str) -> AsyncGenerator[str, None]:
-    """Genera la respuesta de streaming de Flowise y la envía como fragmentos"""
-    completion = client.create_prediction(
-        PredictionData(
-            chatflowId=ChatflowId,
-            question=question,
-            streaming=True,
-            overrideConfig={"SessionId": session_id}
-        )
-    )
-
-    for chunk in completion:
-        try:
-            if isinstance(chunk, str):
-                chunk_data = json.loads(chunk)
-                if "choices" in chunk_data:
-                    for choice in chunk_data["choices"]:
-                        delta_content = choice["delta"].get("content", "")
-                        response_chunk = json.dumps({
-                            "id": chunk_data.get("id"),
-                            "object": chunk_data.get("object"),
-                            "created": chunk_data.get("created"),
-                            "model": chunk_data.get("model"),
-                            "system_fingerprint": chunk_data.get("system_fingerprint"),
-                            "choices": [{
-                                "index": choice.get("index"),
-                                "delta": {"content": delta_content},
-                                "logprobs": choice.get("logprobs"),
-                                "finish_reason": choice.get("finish_reason")
-                            }]
-                        }) + "\n\n"
-                        yield response_chunk
-        except json.JSONDecodeError:
-            continue
-
-    # Cuando el stream termina, envía el final
-    yield json.dumps({
-        "choices": [{
-            "delta": {},
-            "finish_reason": "stop"
-        }]
-    }) + "\n\n"
+client = Flowise(base_url="https://flowise-liy3.onrender.com", api_key="8NV4sPvewPTEBCl3KxOwpFsniEiXS0Ex6TCKpxKbFuQ")
 
 @app.post("/v1/chat/completions")
-async def chat_completion(request: Request, authorization: str = Header(None)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Authorization header missing or invalid")
+async def chat(request: Request, authorization: str = Header(None)):
+    if not authorization.startswith("Bearer "):
+        return {"error": "Invalid Authorization header"}
+    
+    session_id = authorization.split("Bearer ")[1]  # Using the API key as session_id
+    
+    data = await request.json()
+    chatflow_id = data.get('model', '')  # Using the 'model' as chatflow_id
+    messages = data.get('messages', [])
+    stream = data.get('stream', False)
 
-    # Extraer el session_id del header Authorization
-    session_id = authorization.replace("Bearer ", "")
+    # Additional OpenAI parameters (some will be ignored for Flowise)
+    max_tokens = data.get('max_tokens')
+    temperature = data.get('temperature')
+    top_p = data.get('top_p')
+    n = data.get('n')
+    stop = data.get('stop')
+    presence_penalty = data.get('presence_penalty')
+    frequency_penalty = data.get('frequency_penalty')
+    logit_bias = data.get('logit_bias')
+    user = data.get('user')
 
-    body = await request.json()
-    ChatflowId = body.get("model")
-    question = body["messages"][-1]["content"]
+    if not stream:
+        return {"error": "Only streaming responses are supported"}
 
-    # Configurar el cliente Flowise con el base_url fijo
-    client = Flowise(base_url=BASE_URL, api_key=session_id)  # session_id se usa como api_key
+    # Combine system and user messages into one prompt for Flowise
+    system_message = next((msg['content'] for msg in messages if msg['role'] == 'system'), "")
+    user_messages = [msg['content'] for msg in messages if msg['role'] == 'user']
+    
+    combined_prompt = f"{system_message}\n\n" + "\n".join(user_messages)
 
-    # Enviar la respuesta de streaming
-    return StreamingResponse(stream_response(client, question, session_id, ChatflowId), media_type="application/json")
+    # Prepare override config
+    override_config = {
+        "sessionId": session_id,
+        "chatHistory": messages,  # Passing full message history
+    }
+
+    # Add OpenAI parameters to override_config if they are present
+    if max_tokens is not None:
+        override_config["maxTokens"] = max_tokens
+    if temperature is not None:
+        override_config["temperature"] = temperature
+    if top_p is not None:
+        override_config["topP"] = top_p
+    # Note: n, stop, presence_penalty, frequency_penalty, logit_bias are not typically used in Flowise
+    # but you could add them to override_config if Flowise supports them
+
+    async def generate():
+        completion = client.create_prediction(
+            PredictionData(
+                chatflowId=chatflow_id,
+                question=combined_prompt,
+                streaming=True,
+                overrideConfig=override_config
+            )
+        )
+
+        chat_id = f"chatcmpl-{int(time.time())}"
+        created_time = int(time.time())
+        system_fingerprint = "fp_" + os.urandom(5).hex()
+
+        # Send initial message
+        yield f"data: {json.dumps({
+            'id': chat_id,
+            'object': 'chat.completion.chunk',
+            'created': created_time,
+            'model': chatflow_id,
+            'system_fingerprint': system_fingerprint,
+            'choices': [{
+                'index': 0,
+                'delta': {
+                    'role': 'assistant',
+                    'content': '',
+                    'refusal': None
+                },
+                'logprobs': None,
+                'finish_reason': None
+            }]
+        })}\n\n".encode('utf-8')
+
+        for chunk in completion:
+            try:
+                chunk_data = json.loads(chunk)
+                if "data" in chunk_data:
+                    for data in chunk_data["data"]:
+                        if isinstance(data, dict) and "messages" in data:
+                            message = data["messages"][0] if data["messages"] else ""
+                            response = {
+                                'id': chat_id,
+                                'object': 'chat.completion.chunk',
+                                'created': created_time,
+                                'model': chatflow_id,
+                                'system_fingerprint': system_fingerprint,
+                                'choices': [{
+                                    'index': 0,
+                                    'delta': {
+                                        'content': message
+                                    },
+                                    'logprobs': None,
+                                    'finish_reason': None
+                                }]
+                            }
+                            yield f"data: {json.dumps(response)}\n\n".encode('utf-8')
+            except json.JSONDecodeError:
+                yield f"data: {json.dumps({'error': f'Error decoding JSON from chunk: {chunk}'})}\n\n".encode('utf-8')
+            
+            await asyncio.sleep(0)  # Allow other tasks to run
+
+        # Send the final message to indicate completion
+        yield f"data: {json.dumps({
+            'id': chat_id,
+            'object': 'chat.completion.chunk',
+            'created': created_time,
+            'model': chatflow_id,
+            'system_fingerprint': system_fingerprint,
+            'choices': [{
+                'index': 0,
+                'delta': {},
+                'logprobs': None,
+                'finish_reason': 'stop'
+            }]
+        })}\n\n".encode('utf-8')
+
+        # Send [DONE] message
+        yield b"data: [DONE]\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001)
