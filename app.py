@@ -11,7 +11,7 @@ load_dotenv()
 
 app = FastAPI()
 
-client = Flowise(base_url=os.getenv("BASE_URL"), api_key=os.getenv("JWT"))
+client = Flowise(base_url="https://flowise-liy3.onrender.com", api_key=os.getenv("JWT"))
 
 @app.post("/v1/chat/completions")
 async def chat(request: Request, authorization: str = Header(None)):
